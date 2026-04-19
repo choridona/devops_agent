@@ -1,0 +1,132 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: S3 upload Lambda with DevOps Agent auto-investigation
+
+Parameters:
+  EnableUpload:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Set to 'true' to enable S3 uploads, 'false' to disable.
+  S3BucketName:
+    Type: String
+    Description: Name of the target S3 bucket for uploads.
+  DevOpsAgentWebhookUrl:
+    Type: String
+    Description: AWS DevOps Agent webhook URL (from Agent Space > Integrations)
+  DevOpsAgentWebhookSecret:
+    Type: String
+    NoEcho: true
+    Description: AWS DevOps Agent webhook secret (Bearer token)
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 128
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+
+Resources:
+  S3UploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: s3-upload-function
+      Handler: lambda_function.handler
+      CodeUri: src/
+      Description: Uploads a file to S3 when ENABLE_UPLOAD is true.
+      Environment:
+        Variables:
+          ENABLE_UPLOAD: !Ref EnableUpload
+          S3_BUCKET_NAME: !Ref S3BucketName
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref S3BucketName
+
+  S3UploadFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${S3UploadFunction}"
+      RetentionInDays: 30
+
+  LogErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref S3UploadFunctionLogGroup
+      FilterName: LogErrorFilter
+      FilterPattern: "%LOG-ERROR%"
+      MetricTransformations:
+        - MetricName: LambdaLogErrorCount
+          MetricNamespace: DevOpsAgent/Lambda
+          MetricValue: "1"
+          DefaultValue: 0
+
+  LogErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: s3-upload-function-log-error
+      AlarmDescription: LOG-ERROR detected in s3-upload-function
+      Namespace: DevOpsAgent/Lambda
+      MetricName: LambdaLogErrorCount
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  AlarmToInvestigationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: cloudwatch-alarm-to-investigation
+      Description: Trigger DevOps Agent investigation when CloudWatch alarm fires
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          state:
+            value:
+              - ALARM
+          alarmName:
+            - !Ref LogErrorAlarm
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt InvestigationTriggerFunction.Arn
+          Id: InvestigationTrigger
+
+  InvestigationTriggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: devops-agent-investigation-trigger
+      Handler: devops_agent_trigger.handler
+      CodeUri: src/investigation_trigger/
+      Description: Posts to DevOps Agent webhook when a CloudWatch alarm fires.
+      Environment:
+        Variables:
+          DEVOPS_AGENT_WEBHOOK_URL: !Ref DevOpsAgentWebhookUrl
+          DEVOPS_AGENT_WEBHOOK_SECRET: !Ref DevOpsAgentWebhookSecret
+
+  InvestigationTriggerFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InvestigationTriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AlarmToInvestigationRule.Arn
+
+Outputs:
+  S3UploadFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt S3UploadFunction.Arn
+
+  S3UploadFunctionName:
+    Description: Lambda function name
+    Value: !Ref S3UploadFunction
+
+  InvestigationTriggerFunctionArn:
+    Description: Investigation trigger Lambda ARN
+    Value: !GetAtt InvestigationTriggerFunction.Arn
