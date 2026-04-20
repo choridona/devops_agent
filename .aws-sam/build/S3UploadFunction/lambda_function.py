@@ -16,12 +16,7 @@ def handler(event, context):
     file_content = event.get("file_content", "Hello from Lambda!")
 
     if not enable_upload:
-        logger.error(
-            "LOG-ERROR:Upload is disabled. Set ENABLE_UPLOAD=true to allow S3 uploads. "
-            "file_name=%s, bucket=%s",
-            file_name,
-            bucket_name,
-        )
+        logger.error("LOG-ERROR file_name=%s bucket=%s reason=upload_disabled", file_name, bucket_name)
         return {
             "statusCode": 403,
             "body": json.dumps({"message": "Upload is disabled by configuration."}),
@@ -34,7 +29,7 @@ def handler(event, context):
             Key=file_name,
             Body=file_content.encode("utf-8"),
         )
-        logger.info("LOG-SUCCESS:Successfully uploaded %s to s3://%s", file_name, bucket_name)
+        logger.info("LOG-SUCCESS file_name=%s bucket=%s", file_name, bucket_name)
         return {
             "statusCode": 200,
             "body": json.dumps({
@@ -44,5 +39,5 @@ def handler(event, context):
             }),
         }
     except ClientError as e:
-        logger.error("Failed to upload %s to S3: %s", file_name, e)
+        logger.error("LOG-ERROR file_name=%s bucket=%s reason=s3_client_error error=%s", file_name, bucket_name, str(e))
         raise

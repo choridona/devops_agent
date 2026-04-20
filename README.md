@@ -1,132 +1,140 @@
-# S3 Upload Lambda
+# DevOps Agent 自動調査デモ
 
-フィーチャーフラグ付きで S3 へファイルをアップロードする AWS Lambda 関数です。
-
-## 概要
-
-| 項目 | 内容 |
-|------|------|
-| ランタイム | Python 3.12 |
-| メモリ | 128 MB |
-| タイムアウト | 30 秒 |
-| デプロイ方式 | AWS SAM |
+S3 アップロード Lambda を使った DevOps Agent 自動調査のデモ環境です。
 
 ## アーキテクチャ
 
 ```
 呼び出し元 → Lambda (s3-upload-function)
                 │
-                ├─ ENABLE_UPLOAD=false → 403 (アップロード無効)
+                ├─ ENABLE_UPLOAD=false → LOG-ERROR file_name=xxx
+                │       │
+                │       └─ CloudWatch MetricFilter → Alarm
+                │               │
+                │               └─ EventBridge Rule
+                │                       │
+                │                       └─ InvestigationTriggerFunction
+                │                               │ CW Logs から file_name 取得
+                │                               │ Secrets Manager から認証情報取得
+                │                               └─ DevOps Agent Webhook
+                │                                       │
+                │                          Skills に従い自律調査
+                │                          ├─ 10分待機
+                │                          ├─ LOG-SUCCESS 確認
+                │                          └─ Slack 通知（コンソール設定済み）
                 │
-                └─ ENABLE_UPLOAD=true  → S3 PutObject → バケット
+                └─ ENABLE_UPLOAD=true → LOG-SUCCESS file_name=xxx → S3 PutObject
 ```
 
-## パラメータ
+---
 
-| パラメータ | 型 | デフォルト | 説明 |
-|-----------|-----|-----------|------|
-| `EnableUpload` | String | `false` | `true` でアップロード有効化 |
-| `S3BucketName` | String | (必須) | アップロード先 S3 バケット名 |
+## デプロイ手順
 
-## デプロイ
+### ステップ 1: 初回 SAM デプロイ
 
 ```bash
-# ビルド
 sam build
 
-# 初回デプロイ（対話形式 / samconfig.toml を生成）
-sam deploy --guided
-
-# パラメータ指定でデプロイ
 sam deploy \
-  --stack-name s3-upload-lambda \
+  --stack-name devops-agent-demo \
   --region ap-northeast-1 \
-  --capabilities CAPABILITY_IAM \
-  --parameter-overrides \
-    EnableUpload=true \
-    S3BucketName=my-bucket
-
-# 2回目以降（samconfig.toml が存在する場合）
-sam deploy
-
-# フラグを切り替えてだけ再デプロイ
-sam deploy \
-  --parameter-overrides \
-    EnableUpload=false \
-    S3BucketName=dev-ops-agent-test-004246190174-ap-northeast-1-an \
-    DevOpsAgentWebhookUrl=https://event-ai.ap-northeast-1.api.aws/webhook/generic/44b3c194-3cc3-4d12-afa0-aeb8b6cc582e \
-    DevOpsAgentWebhookSecret=qfzO3dmGoxOg0aKmhk0ZZtSW6xh4EHUWNCv3+BWISqI=
-
-# スタック削除
-sam delete --stack-name s3-upload-lambda
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+  --parameter-overrides EnableUpload=false
 ```
+
+デプロイ後、以下の Output を控える。
+
+| Output キー | 用途 |
+|-------------|------|
+| `AgentSpaceId` | コンソールで Webhook 作成時に使用 |
+| `WebhookCredentialsSecretArn` | Webhook 認証情報の格納先 |
+
+---
+
+### ステップ 2: コンソールでの作業（初回のみ）
+
+#### 2-1. Generic Webhook を作成
+
+1. [DevOps Agent コンソール](https://console.aws.amazon.com/devops-agent/) を開く
+2. `AgentSpaceId` に対応する Agent Space を選択
+3. **Integrations** → **Generic Webhook** → **Create**
+4. 生成された **Webhook URL** と **Secret** をメモする
+
+> Webhook ServiceId はコンソール経由でのみ登録できるため、CloudFormation 外で作成する。
+
+#### 2-2. Secrets Manager: 認証情報を更新
+
+```bash
+aws secretsmanager put-secret-value \
+  --secret-id <WebhookCredentialsSecretArn> \
+  --secret-string '{"webhook_url":"<Webhook URL>","webhook_secret":"<Secret>"}'
+```
+
+#### 2-3. Skills のアップロード
+
+1. `skills/s3-upload-investigation/` を zip 圧縮する
+   ```bash
+   cd skills && zip -r s3-upload-investigation.zip s3-upload-investigation/
+   ```
+2. DevOps Agent コンソール → **Skills** → **Upload** でアップロード
+
+---
+
+### 2回目以降の SAM デプロイ
+
+`EnableUpload` の切り替えのみで OK。
+
+```bash
+sam deploy --parameter-overrides EnableUpload=true   # アップロード有効化
+sam deploy --parameter-overrides EnableUpload=false  # エラーパターン（調査トリガー）
+```
+
+---
 
 ## Lambda の呼び出し
-
-### イベント形式
-
-```json
-{
-  "file_name": "hello.txt",
-  "file_content": "アップロードする内容"
-}
-```
-
-| フィールド | 必須 | デフォルト | 説明 |
-|-----------|------|-----------|------|
-| `file_name` | いいえ | `sample.txt` | S3 オブジェクトキー |
-| `file_content` | いいえ | `Hello from Lambda!` | ファイルの内容（UTF-8 文字列） |
-
-### CLI での実行例
 
 ```bash
 aws lambda invoke \
   --function-name s3-upload-function \
-  --payload '{"file_name": "test.txt", "file_content": "Hello"}' \
+  --payload '{"file_name": "test.txt"}' \
   --cli-binary-format raw-in-base64-out \
   response.json
-
-cat response.json
 ```
 
-### レスポンス例
+---
 
-**成功 (200)**
-```json
-{
-  "statusCode": 200,
-  "body": "{\"message\": \"File uploaded successfully.\", \"bucket\": \"my-bucket\", \"key\": \"test.txt\"}"
-}
-```
+## ログフォーマット
 
-**アップロード無効 (403)**
-```json
-{
-  "statusCode": 403,
-  "body": "{\"message\": \"Upload is disabled by configuration.\"}"
-}
-```
+| 種別 | フォーマット |
+|------|------------|
+| エラー | `LOG-ERROR file_name=xxx bucket=yyy reason=zzz` |
+| 成功 | `LOG-SUCCESS file_name=xxx bucket=yyy` |
 
-## 環境変数
+`reason` の値:
+- `upload_disabled` — ENABLE_UPLOAD=false
+- `s3_client_error` — S3 API エラー
 
-| 変数名 | 説明 |
-|--------|------|
-| `ENABLE_UPLOAD` | `true` のときのみ S3 へアップロード |
-| `S3_BUCKET_NAME` | アップロード先バケット名 |
+---
 
-## IAM 権限
+## パラメータ
 
-SAM の `S3CrudPolicy` により、指定バケットへの CRUD 操作が自動付与されます。
+| パラメータ | デフォルト | 説明 |
+|-----------|-----------|------|
+| `EnableUpload` | `false` | `true` でアップロード有効化 |
 
-## ログ
-
-CloudWatch Logs グループ: `/aws/lambda/s3-upload-function`（保持期間: 30 日）
+---
 
 ## ディレクトリ構成
 
 ```
 .
-├── template.yaml       # SAM テンプレート
+├── template.yaml
+├── samconfig.toml
+├── skills/
+│   └── s3-upload-investigation/
+│       └── SKILL.md
 └── src/
-    └── lambda_function.py  # Lambda ハンドラ
+    ├── lambda_function.py
+    └── investigation_trigger/
+        └── devops_agent_trigger.py
 ```

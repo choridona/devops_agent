@@ -9,41 +9,68 @@ Parameters:
     AllowedValues:
       - "true"
       - "false"
-    Description: Set to 'true' to enable S3 uploads, 'false' to disable.
-  S3BucketName:
-    Type: String
-    Description: Name of the target S3 bucket for uploads.
-  DevOpsAgentWebhookUrl:
-    Type: String
-    Description: AWS DevOps Agent webhook URL (from Agent Space > Integrations)
-  DevOpsAgentWebhookSecret:
-    Type: String
-    NoEcho: true
-    Description: AWS DevOps Agent webhook secret (Bearer token)
+    Description: Set to 'true' to enable S3 uploads, 'false' to disable (triggers LOG-ERROR).
 
 Globals:
   Function:
-    Timeout: 30
-    MemorySize: 128
     Runtime: python3.12
     Architectures:
       - x86_64
+    MemorySize: 128
 
 Resources:
+
+# ============================================================
+# DevOps Agent Space + Webhook
+# ============================================================
+  AgentSpace:
+    Type: AWS::DevOpsAgent::AgentSpace
+    Properties:
+      Name: !Sub "devops-agent-${AWS::StackName}"
+      Description: "DevOps Agent Space for automated S3 upload error investigation"
+
+  # Webhook 認証情報は初回デプロイ後にコンソールで取得して手動更新する
+  WebhookCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "devops-agent-webhook-${AWS::StackName}"
+      Description: "DevOps Agent Generic Webhook credentials. Update after Step 2 (console setup)."
+      SecretString: '{"webhook_url":"PLACEHOLDER","webhook_secret":"PLACEHOLDER"}'
+
+# ============================================================
+# S3 バケット
+# ============================================================
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+# ============================================================
+# S3 Upload Lambda (テスト対象)
+# ============================================================
   S3UploadFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: s3-upload-function
       Handler: lambda_function.handler
       CodeUri: src/
-      Description: Uploads a file to S3 when ENABLE_UPLOAD is true.
+      Timeout: 30
+      Description: Uploads a file to S3 when ENABLE_UPLOAD=true, otherwise outputs LOG-ERROR.
       Environment:
         Variables:
           ENABLE_UPLOAD: !Ref EnableUpload
-          S3_BUCKET_NAME: !Ref S3BucketName
+          S3_BUCKET_NAME: !Ref UploadBucket
       Policies:
         - S3CrudPolicy:
-            BucketName: !Ref S3BucketName
+            BucketName: !Ref UploadBucket
 
   S3UploadFunctionLogGroup:
     Type: AWS::Logs::LogGroup
@@ -51,6 +78,9 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/${S3UploadFunction}"
       RetentionInDays: 30
 
+# ============================================================
+# CloudWatch Alarm: LOG-ERROR 検知
+# ============================================================
   LogErrorMetricFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
@@ -77,6 +107,9 @@ Resources:
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
 
+# ============================================================
+# EventBridge: Alarm → Investigation Trigger
+# ============================================================
   AlarmToInvestigationRule:
     Type: AWS::Events::Rule
     Properties:
@@ -104,11 +137,29 @@ Resources:
       FunctionName: devops-agent-investigation-trigger
       Handler: devops_agent_trigger.handler
       CodeUri: src/investigation_trigger/
-      Description: Posts to DevOps Agent webhook when a CloudWatch alarm fires.
+      Timeout: 60
+      Description: Extracts failed file_name from logs and posts to DevOps Agent webhook.
       Environment:
         Variables:
-          DEVOPS_AGENT_WEBHOOK_URL: !Ref DevOpsAgentWebhookUrl
-          DEVOPS_AGENT_WEBHOOK_SECRET: !Ref DevOpsAgentWebhookSecret
+          WEBHOOK_SECRET_ARN: !Ref WebhookCredentialsSecret
+          LOG_GROUP_NAME: !Sub "/aws/lambda/s3-upload-function"
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:StartQuery
+                - logs:GetQueryResults
+                - logs:StopQuery
+              Resource: "*"
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref WebhookCredentialsSecret
+
+  InvestigationTriggerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${InvestigationTriggerFunction}"
+      RetentionInDays: 30
 
   InvestigationTriggerFunctionPermission:
     Type: AWS::Lambda::Permission
@@ -118,13 +169,24 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt AlarmToInvestigationRule.Arn
 
+# ============================================================
+# Outputs
+# ============================================================
 Outputs:
-  S3UploadFunctionArn:
-    Description: Lambda function ARN
-    Value: !GetAtt S3UploadFunction.Arn
+  AgentSpaceId:
+    Description: "DevOps Agent Space ID — use when creating webhook in console"
+    Value: !GetAtt AgentSpace.AgentSpaceId
+
+  WebhookCredentialsSecretArn:
+    Description: "Secrets Manager ARN — update with webhook_url and webhook_secret after console setup"
+    Value: !Ref WebhookCredentialsSecret
+
+  UploadBucketName:
+    Description: S3 bucket name for uploads
+    Value: !Ref UploadBucket
 
   S3UploadFunctionName:
-    Description: Lambda function name
+    Description: S3 upload Lambda name
     Value: !Ref S3UploadFunction
 
   InvestigationTriggerFunctionArn:
